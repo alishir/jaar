@@ -1,5 +1,6 @@
 # coding: utf-8
 
+from cmath import log
 import scrapy
 from scrapy.exceptions import CloseSpider
 import json
@@ -11,11 +12,17 @@ from parsivar import Tokenizer
 class DivarSpider(scrapy.Spider):
     name = 'divar'
     allowed_domains = ['divar.ir']
-    list_base_url = 'https://api.divar.ir/v8/web-search/4/residential-rent'
+    list_type = 'rent'  # sell or rent
+    list_base_url = 'https://api.divar.ir/v8/web-search/4/residential-' + list_type
     post_base_url = 'https://divar.ir/v/'
     json_schema = {
         "category": {
-            "value": "residential-rent"
+            "value": "residential-" + list_type
+        },
+        "districts": {
+            "vacancies": [
+                "1577"
+            ]
         },
         "cities": [
             "4"
@@ -33,6 +40,35 @@ class DivarSpider(scrapy.Spider):
     # Control crawler from pipeline
     stop_on_duplicate = False
 
+    key_map = {
+        'ودیعه': 'rahn',
+        'اجارهٔ ماهانه': 'rent',
+        'ودیعه و اجاره': 'convertable',
+        'مناسب برای': 'suitable_for',
+        'آگهی‌دهنده': 'adv_by',
+        'طبقه': 'floor',
+        'قیمت کل': 'total_price',
+        'قیمت هر متر': 'meter_price',
+        'متراژ': 'space',
+        'ساخت': 'year',
+        'اتاق': 'rooms'
+    }
+
+    xpath = {
+        'rent': {
+            'title': '/html/body/div/div/div[1]/div/div/div[1]/div[1]/div/div[1]/text()',
+            'sub_title': '/html/body/div/div/div[1]/div/div/div[1]/div[1]/div/div[2]/text()',
+            'info': '/html/body/div/div/div[1]/div/div/div[1]/div[4]',
+            'desc': '/html/body/div/div/div[1]/div/div/div[1]/div[5]/div[2]/div/p/text()'
+        },
+        'sell': {
+            'title': '/html/body/div/div/div[1]/div/div/div[1]/div[1]/div/div[1]/text()',
+            'sub_title': '/html/body/div/div/div[1]/div/div/div[1]/div[1]/div/div[2]/text()',
+            'info': '/html/body/div/div/div[1]/div/div/div[1]/div[4]',
+            'desc': '/html/body/div/div/div[1]/div/div/div[1]/div[5]/div[2]/div/p/text()'
+        }
+    }
+
     def start_requests(self):
         body = {
             "json_schema": self.json_schema,
@@ -47,9 +83,10 @@ class DivarSpider(scrapy.Spider):
     def parse_post(self, response):
         if self.stop_on_duplicate:
             raise CloseSpider('Already been scraped.')
-        title_xpath = '/html/body/div/div[1]/div/div/div[1]/div[1]/div/div[1]/text()'
-        info_xpath = '/html/body/div/div[1]/div/div/div[1]/div[4]'
-        desc_xpath = '/html/body/div/div[1]/div/div/div[1]/div[5]/div[2]/div/p/text()'
+        title_xpath = self.xpath[self.list_type]['title']
+        sub_title_xpath = self.xpath[self.list_type]['sub_title']
+        info_xpath = self.xpath[self.list_type]['info']
+        desc_xpath = self.xpath[self.list_type]['desc']
 
         info_sel = response.xpath(info_xpath)
         info = self.extract_info(info_sel)
@@ -57,22 +94,19 @@ class DivarSpider(scrapy.Spider):
         title = response.xpath(title_xpath).get()
         title = self.normalizer.normalize(title)
 
+        sub_title = response.xpath(sub_title_xpath).get()
+        sub_title = self.normalizer.normalize(sub_title)
+
         desc = response.xpath(desc_xpath).get()
         desc = self.normalizer.normalize(desc)
 
-        yield {
-            'id': response.meta['token'],
-            'url': response.url,
-            'title': title,
-            'desc': desc,
-            'year': info['year'],
-            'space': info['space'],
-            'rahn': info['rahn'],
-            'rent': info['rent'],
-            'elevator': info.get('elevator', False),
-            'parking': info.get('parking', False),
-            'cabinet': info.get('cabinet', False)
-        }
+        info['desc'] = desc
+        info['url'] = response.url
+        info['id'] = response.meta['token']
+        info['title'] = title
+        info['sub_title'] = sub_title
+
+        yield info
 
     def parse_list(self, response):
         body = json.loads(response.body)
@@ -87,7 +121,7 @@ class DivarSpider(scrapy.Spider):
 
         last_post_date = posts[0]['action_log']['server_side_info']['info']['extra_data']['last_post_sort_date']
         day_epocs_us = 86400 * 1000 * 1000
-        last_date = (time.time_ns() // 1000) - (2 * 30 * day_epocs_us)
+        last_date = (time.time_ns() // 1000) - (2 * 7 * day_epocs_us)
         if last_post_date > last_date:
             body = {
                 "json_schema": self.json_schema,
@@ -109,14 +143,8 @@ class DivarSpider(scrapy.Spider):
             title = self.normalizer.normalize(title)
             value = self.normalizer.normalize(value)
 
-            if title == 'متراژ':
-                key = 'space'
-                key_found = True
-            elif title == 'اتاق':
-                key = 'rooms'
-                key_found = True
-            elif title == 'ساخت':
-                key = 'year'
+            if title in self.key_map.keys():
+                key = self.key_map.get(title)
                 key_found = True
             elif 'ودیعه' in title:
                 key = 'rahn'
@@ -165,14 +193,11 @@ class DivarSpider(scrapy.Spider):
 
             title = self.normalizer.normalize(title)
 
-            if title == 'ودیعه':
-                key = 'rahn'
+            if title in self.key_map.keys():
+                key = self.key_map.get(title)
                 key_found = True
-                value = self.tokenize_price(value)
-            elif 'ماهانه' in title:
-                key = 'rent'
-                value = self.tokenize_price(value)
-                key_found = True
+                if key in ['total_price', 'rent', 'rahn', 'meter_price']:
+                    value = self.tokenize_price(value)
 
             if key_found:
                 info[key] = value
@@ -182,8 +207,8 @@ class DivarSpider(scrapy.Spider):
     def tokenize_price(self, value):
         parts = self.tokenizer.tokenize_words(value)
         if len(parts) == 1:
-            return 0
-        elif len(parts) == 2:
+            return value
+        elif len(parts) == 2 and parts[1] == 'تومان':
             value = self.normalizer.normalize(parts[0])
             value = ''.join(filter(str.isdigit, value))
             value = int(value) / 1000000.0
